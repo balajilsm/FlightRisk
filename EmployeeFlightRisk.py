@@ -1,5 +1,7 @@
-# app.py — Flight Risk Predictor (Beginner-friendly)
-# Upload CSV → pick target → train model → view metrics → download predictions
+# EmployeeFlightRisk.py — Fast-mode Flight Risk Predictor
+# ✅ Faster cold starts
+# ✅ "Fast mode" for big CSVs (sampling + capped categoricals)
+# ✅ Toggle between Random Forest (slower, explainable) and Logistic (fast)
 
 import io
 import numpy as np
@@ -15,52 +17,69 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Flight Risk Predictor", page_icon="✈️", layout="wide")
-st.title("✈️ Flight Risk Predictor")
-st.caption("Upload your employee data CSV, choose the target column (e.g., flight_risk / attrition), and train a model.")
+st.set_page_config(page_title="Flight Risk Predictor (Fast)", page_icon="✈️", layout="wide")
+st.title("✈️ Flight Risk Predictor (Fast)")
+st.caption("Upload CSV → pick target → train → metrics → download predictions. Includes a faster path for large files.")
 
 # ----------------------------
-# Helpers
+# Speed/robustness helpers
 # ----------------------------
 TRUTHY = {"1","true","yes","y","left","leaver","attrited","churn","quit","resigned","separated"}
 FALSY  = {"0","false","no","n","stay","stayed","active","retained"}
 
 def coerce_binary_target(series: pd.Series) -> pd.Series:
-    """Map common labels to 0/1."""
-    s = series.copy()
-    # numeric-like?
-    try:
-        sn = pd.to_numeric(s, errors="coerce")
-        uniq = set(np.unique(sn.dropna()))
-        if uniq.issubset({0,1}):
-            return sn.fillna(0).astype(int)
-    except Exception:
-        pass
-    s_str = s.astype(str).str.strip().str.lower()
+    # Try numeric first
+    sn = pd.to_numeric(series, errors="coerce")
+    uniq = set(np.unique(sn.dropna()))
+    if uniq and uniq.issubset({0,1}):
+        return sn.fillna(0).astype(int)
 
-    def map_label(x: str) -> int:
+    s = series.astype(str).str.strip().str.lower()
+    def m(x: str) -> int:
         if x in TRUTHY: return 1
         if x in FALSY:  return 0
         if any(k in x for k in ["left","leave","attrit","quit","resign","terminate","churn","separat"]): return 1
         if any(k in x for k in ["stay","active","retain","present"]): return 0
         return 0
-    return s_str.map(map_label).astype(int)
+    return s.map(m).astype(int)
 
-def prepare_features(df: pd.DataFrame, feature_cols: list) -> pd.DataFrame:
-    """Basic cleaning + one-hot using pandas.get_dummies (version-safe)."""
+def cap_categorical_cardinality(df: pd.DataFrame, max_uniques=30):
+    """Replace rare categories with 'Other' to shrink one-hot size."""
+    capped = df.copy()
+    for c in capped.columns:
+        if not pd.api.types.is_numeric_dtype(capped[c]):
+            vc = capped[c].astype(str).value_counts()
+            keep = set(vc.head(max_uniques).index)
+            capped[c] = capped[c].astype(str).where(capped[c].astype(str).isin(keep), "Other")
+    return capped
+
+def prepare_features(df: pd.DataFrame, feature_cols: list, fast_mode=False) -> pd.DataFrame:
     X = df[feature_cols].copy()
+
+    # Basic cleaning
     for col in X.columns:
         if pd.api.types.is_numeric_dtype(X[col]):
             X[col] = pd.to_numeric(X[col], errors="coerce").fillna(X[col].median())
         else:
             X[col] = X[col].astype(str).fillna("Unknown").replace({"nan": "Unknown"})
+
+    # Cap cardinality in fast mode
+    if fast_mode:
+        X = cap_categorical_cardinality(X, max_uniques=30)
+
+    # One-hot via pandas (fast & version-safe)
     cat_cols = [c for c in X.columns if not pd.api.types.is_numeric_dtype(X[c])]
     num_cols = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c])]
     X_cat = pd.get_dummies(X[cat_cols], drop_first=True) if cat_cols else pd.DataFrame(index=X.index)
     X_num = X[num_cols] if num_cols else pd.DataFrame(index=X.index)
-    return pd.concat([X_num, X_cat], axis=1)
+    X_enc = pd.concat([X_num, X_cat], axis=1)
 
-def top_features(model, feature_names, top_n=15):
+    # Remove columns with zero variance (can happen after capping)
+    nunique = X_enc.nunique()
+    keep_cols = nunique[nunique > 1].index
+    return X_enc[keep_cols]
+
+def top_features(model, feature_names, top_n=12):
     if hasattr(model, "feature_importances_"):
         vals = model.feature_importances_
     elif hasattr(model, "coef_"):
@@ -71,13 +90,19 @@ def top_features(model, feature_names, top_n=15):
     return pd.DataFrame({"feature": np.array(feature_names)[idx], "importance": vals[idx]})
 
 # ----------------------------
-# Sidebar
+# Sidebar tuning (speed-focused)
 # ----------------------------
 st.sidebar.header("⚙️ Settings")
-model_choice = st.sidebar.selectbox("Model", ["Random Forest", "Logistic Regression"])
+model_choice = st.sidebar.selectbox("Model", ["Logistic Regression (fast)", "Random Forest (explainable)"])
+fast_mode = st.sidebar.toggle("Fast mode (recommended for large CSVs)", value=True)
+sample_rows = st.sidebar.number_input("Max rows in fast mode", min_value=1000, value=5000, step=1000)
 test_size = st.sidebar.slider("Test size", 0.1, 0.4, 0.2, 0.05)
 random_state = st.sidebar.number_input("Random seed", min_value=0, value=42, step=1)
 max_rows_preview = st.sidebar.slider("Preview rows", 5, 50, 10, 5)
+
+# RF knobs (used only if selected)
+rf_estimators = st.sidebar.slider("RF: n_estimators", 50, 400, 120, 10)
+rf_max_depth = st.sidebar.select_slider("RF: max_depth", options=[None, 6, 8, 10, 12], value=None)
 
 # ----------------------------
 # Upload
@@ -105,11 +130,17 @@ if file is not None:
         st.warning("Please select at least one feature column.")
         st.stop()
 
+    # Optional sampling to speed up training
+    work_df = df
+    if fast_mode and len(df) > sample_rows:
+        work_df = df.sample(n=sample_rows, random_state=random_state).reset_index(drop=True)
+        st.info(f"Fast mode: sampled {len(work_df):,} rows from {len(df):,} to speed up training.")
+
     st.subheader("3) 🧠 Train the Model")
     if st.button("Train & Evaluate"):
-        with st.spinner("Training..."):
-            y = coerce_binary_target(df[target_col])
-            X = prepare_features(df, feature_cols)
+        with st.spinner("Training (fast)…"):
+            y = coerce_binary_target(work_df[target_col])
+            X = prepare_features(work_df, feature_cols, fast_mode=fast_mode)
             X = X.replace([np.inf, -np.inf], np.nan).dropna()
             y = y.loc[X.index]
 
@@ -121,12 +152,15 @@ if file is not None:
                 X, y, test_size=test_size, random_state=random_state, stratify=y
             )
 
-            if model_choice == "Random Forest":
-                model = RandomForestClassifier(
-                    n_estimators=300, random_state=random_state, n_jobs=-1
-                )
+            if model_choice.startswith("Logistic"):
+                model = LogisticRegression(max_iter=600, n_jobs=None)
             else:
-                model = LogisticRegression(max_iter=1000)
+                model = RandomForestClassifier(
+                    n_estimators=rf_estimators,
+                    max_depth=rf_max_depth,
+                    random_state=random_state,
+                    n_jobs=-1
+                )
 
             model.fit(X_train, y_train)
             y_pred = model.predict(X_test)
@@ -159,47 +193,15 @@ if file is not None:
             st.pyplot(fig)
 
             st.subheader("🏅 Top Features")
-            feats = top_features(model, X.columns, top_n=15)
+            feats = top_features(model, X.columns, top_n=12)
             if not feats.empty:
                 st.dataframe(feats.reset_index(drop=True))
             else:
-                st.info("Model doesn't expose importances; try Random Forest.")
+                st.info("Model doesn't expose importances; choose Random Forest for importances.")
 
-            # Score full dataset & allow download
+            # Score FULL dataset with the trained model refit on full (fast but practical)
             st.subheader("⬇️ Download Predictions for Full Data")
-            model.fit(X, y)
-            if hasattr(model, "predict_proba"):
-                proba_full = model.predict_proba(X)[:, 1]
-            else:
-                try:
-                    decision_full = model.decision_function(X)
-                    proba_full = (decision_full - decision_full.min())/(decision_full.max()-decision_full.min()+1e-9)
-                except Exception:
-                    proba_full = np.zeros(len(X))
-            pred_full = model.predict(X)
-
-            out = df.copy()
-            out["flight_risk_pred"] = pred_full
-            out["flight_risk_prob"] = proba_full
-
-            buf = io.BytesIO()
-            out.to_csv(buf, index=False)
-            buf.seek(0)
-            st.download_button(
-                "Download CSV with predictions",
-                data=buf,
-                file_name="flight_risk_scored.csv",
-                mime="text/csv"
-            )
-
-else:
-    st.info("Upload a CSV to begin. Example target values: 0/1, Yes/No, True/False, Left/Stay, etc.")
-
-with st.expander("💡 Tips for better results"):
-    st.markdown("""
-- Target column should indicate leaving risk (e.g., `flight_risk`, `attrition`, `left`).
-- Include numeric features (tenure_months, overtime_hours, pay_change_pct, age).
-- Categorical features (department, job_role, location) are auto one-hot encoded.
-- Start with **Random Forest** to see top features easily.
-- For production: handle class imbalance (class_weight='balanced'), add time-based splits, and calibrate probabilities.
-""")
+            # Prepare full X on the full df with same fast-mode rules
+            y_full = coerce_binary_target(df[target_col])
+            X_full = prepare_features(df, feature_cols, fast_mode=fast_mode)
+            X_full = X_full.replace([np.inf, -np.inf],
