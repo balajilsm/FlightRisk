@@ -1,4 +1,4 @@
-streamlit
-pandas
-scikit-learn
-matplotlib
+streamlit==1.37.0
+pandas==2.2.2
+scikit-learn==1.5.1
+matplotlib==3.9.0
